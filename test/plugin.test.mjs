@@ -2,7 +2,7 @@
  * Host-surface behavior of `dsh-session-actions`.
  *
  * A fake Cordis context stands in for the Harness, so the trust fence, the
- * request validation, and the live-Session refusal are exercised without a
+ * request validation, and the running-Session refusal are exercised without a
  * running application. Those three are exactly the parts that decide whether a
  * destructive endpoint is safe, and each of them fails only in production when
  * it is wrong.
@@ -24,12 +24,15 @@ const ROUTE_PREFIX = '/api2/dsh-session-actions'
 /**
  * A Cordis context exposing only what this plugin reads.
  * @param options.home - Harness home reported by the `dshHomePath` service.
- * @param options.live - Session ids the `sessions` service reports as live.
- * @returns the fake context and the routes it captured.
+ * @param options.loaded - Session ids the `sessions` service reports as attached.
+ * @param options.running - Session ids whose Agent reports `running`.
+ * @param options.emitThrows - fail `emit`, standing in for a throwing listener.
+ * @returns the fake context, its captured routes, and its emitted events.
  */
-function makeCtx({ home, live = [] }) {
+function makeCtx({ home, loaded = [], running = [], emitThrows = false }) {
   const routes = new Map()
   const disposers = []
+  const events = []
   const webServer = {
     register(route) {
       if (routes.has(route.path)) throw new Error(`duplicate route ${route.path}`)
@@ -40,11 +43,16 @@ function makeCtx({ home, live = [] }) {
   const services = {
     webServer,
     dshHomePath: () => home,
-    sessions: { get: id => (live.includes(id) ? { header: { id } } : undefined) },
+    sessions: { get: id => (loaded.includes(id) ? { header: { id } } : undefined) },
+    agents: { get: id => (running.includes(id) ? { status: 'running' } : { status: 'idle' }) },
   }
   const ctx = {
     webServer,
     get: serviceName => services[serviceName],
+    emit(event, ...args) {
+      if (emitThrows) throw new Error('listener threw')
+      events.push([event, ...args])
+    },
     inject(names, callback) {
       if (names.every(serviceName => services[serviceName] !== undefined)) callback(ctx)
     },
@@ -54,7 +62,7 @@ function makeCtx({ home, live = [] }) {
       return dispose
     },
   }
-  return { ctx, routes, disposers }
+  return { ctx, routes, disposers, events }
 }
 
 /** One fake request carrying a JSON body. */
@@ -120,6 +128,8 @@ test('inspect describes a stored Conversation', async (t) => {
   assert.equal(res.status, 200)
   assert.deepEqual(res.payload.value, {
     sessionId: SESSION,
+    loaded: false,
+    running: false,
     live: false,
     exists: true,
     sizeBytes: 512,
@@ -127,13 +137,21 @@ test('inspect describes a stored Conversation', async (t) => {
   })
 })
 
-test('inspect reports a Session that is live in this process', async (t) => {
+test('inspect reports attachment and running separately', async (t) => {
   const home = makeHome()
   t.after(() => { rmSync(home, { recursive: true, force: true }) })
-  const { routes } = mount({ home, live: [SESSION] })
-  const res = await invoke(routes.get(`${ROUTE_PREFIX}/inspect`), { body: JSON.stringify({ sessionId: SESSION }) })
-  assert.equal(res.status, 200)
-  assert.equal(res.payload.value.live, true)
+  // Attached but idle: deletable, and the confirmation surface still needs to
+  // know the process holds it.
+  const attached = await invoke(mount({ home, loaded: [SESSION] }).routes.get(`${ROUTE_PREFIX}/inspect`), {
+    body: JSON.stringify({ sessionId: SESSION }),
+  })
+  assert.equal(attached.payload.value.loaded, true)
+  assert.equal(attached.payload.value.running, false)
+  // Running: refused.
+  const busy = await invoke(mount({ home, loaded: [SESSION], running: [SESSION] }).routes.get(`${ROUTE_PREFIX}/inspect`), {
+    body: JSON.stringify({ sessionId: SESSION }),
+  })
+  assert.equal(busy.payload.value.running, true)
 })
 
 test('the trust fence refuses a non-POST method', async (t) => {
@@ -205,25 +223,50 @@ test('a malformed or oversized body is rejected', async (t) => {
   assert.equal((await invoke(del, { body: JSON.stringify({ sessionId: SESSION, pad: 'x'.repeat(70000) }) })).status, 400)
 })
 
-test('delete refuses a Session that is live in this process, and destroys nothing', async (t) => {
+test('delete refuses a Session whose Agent is running, and destroys nothing', async (t) => {
   const home = makeHome()
   t.after(() => { rmSync(home, { recursive: true, force: true }) })
-  const { routes } = mount({ home, live: [SESSION] })
+  const { routes, events } = mount({ home, loaded: [SESSION], running: [SESSION] })
   const res = await invoke(routes.get(`${ROUTE_PREFIX}/delete`), { body: JSON.stringify({ sessionId: SESSION }) })
   assert.equal(res.status, 409)
-  assert.equal(res.payload.error.code, 'session-live')
+  assert.equal(res.payload.error.code, 'session-running')
   assert.equal(res.payload.error.sessionId, SESSION)
   assert.equal(existsSync(join(sessionsRoot(home), '--Users-someone-project--', SESSION)), true)
+  assert.deepEqual(events, [])
+})
+
+test('delete removes an attached but idle Session', async (t) => {
+  const home = makeHome()
+  t.after(() => { rmSync(home, { recursive: true, force: true }) })
+  const { routes, events } = mount({ home, loaded: [SESSION] })
+  const res = await invoke(routes.get(`${ROUTE_PREFIX}/delete`), { body: JSON.stringify({ sessionId: SESSION }) })
+  assert.equal(res.status, 200)
+  assert.equal(res.payload.value.loaded, true)
+  assert.equal(existsSync(join(sessionsRoot(home), '--Users-someone-project--', SESSION)), false)
+  // The browser drops the row off this event, so it must name the Session that
+  // just lost its storage.
+  assert.deepEqual(events, [['api-session/removed', SESSION]])
+})
+
+test('a throwing removal listener cannot turn a completed delete into a failure', async (t) => {
+  const home = makeHome()
+  t.after(() => { rmSync(home, { recursive: true, force: true }) })
+  const { routes } = mount({ home, emitThrows: true })
+  const res = await invoke(routes.get(`${ROUTE_PREFIX}/delete`), { body: JSON.stringify({ sessionId: SESSION }) })
+  assert.equal(res.status, 200)
+  assert.equal(existsSync(join(sessionsRoot(home), '--Users-someone-project--', SESSION)), false)
 })
 
 test('delete permanently removes a cold Session and reports what it freed', async (t) => {
   const home = makeHome()
   t.after(() => { rmSync(home, { recursive: true, force: true }) })
-  const { routes } = mount({ home })
+  const { routes, events } = mount({ home })
   const res = await invoke(routes.get(`${ROUTE_PREFIX}/delete`), { body: JSON.stringify({ sessionId: SESSION }) })
   assert.equal(res.status, 200)
   assert.equal(res.payload.value.sessionId, SESSION)
+  assert.equal(res.payload.value.loaded, false)
   assert.equal(res.payload.value.freedBytes, 512)
   assert.equal(res.payload.value.registry.pruned, false)
   assert.equal(existsSync(join(sessionsRoot(home), '--Users-someone-project--', SESSION)), false)
+  assert.deepEqual(events, [['api-session/removed', SESSION]])
 })

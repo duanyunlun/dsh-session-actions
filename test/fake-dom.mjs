@@ -57,7 +57,31 @@ function notify(target, added, removed) {
   }
 }
 
-/** A DOM node with the traversal, attribute, and event surface the half uses. */
+/** An element's declared box; zero-sized until a test gives it one. */
+function boxOf(element) {
+  return element.rect ?? { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 }
+}
+
+/** One declaration block: the inline properties the half writes and re-reads. */
+class FakeStyle {
+  constructor() {
+    this.properties = new Map()
+  }
+
+  setProperty(name, value, priority = '') {
+    this.properties.set(name, { value: String(value), priority: String(priority) })
+  }
+
+  getPropertyValue(name) {
+    return this.properties.get(name)?.value ?? ''
+  }
+
+  getPropertyPriority(name) {
+    return this.properties.get(name)?.priority ?? ''
+  }
+}
+
+/** A DOM node with the traversal, attribute, event, and box surface the half uses. */
 export class FakeNode {
   constructor(tagName) {
     this.tagName = tagName
@@ -65,6 +89,22 @@ export class FakeNode {
     this.childNodes = []
     this.parentNode = null
     this.listeners = new Map()
+    this.style = new FakeStyle()
+    this.rect = null
+  }
+
+  /** The laid-out width, zero until a test declares a box. */
+  get offsetWidth() {
+    return boxOf(this).width
+  }
+
+  /** The laid-out height, zero until a test declares a box. */
+  get offsetHeight() {
+    return boxOf(this).height
+  }
+
+  getBoundingClientRect() {
+    return { ...boxOf(this) }
   }
 
   get parentElement() {
@@ -171,6 +211,14 @@ export class FakeNode {
     this.parentNode?.removeChild(this)
   }
 
+  /**
+   * Press this element, as a browser's own `HTMLElement.click()` does: one
+   * bubbling, cancelable `click` event with this element as its target.
+   */
+  click() {
+    this.dispatchEvent(makeEvent('click'))
+  }
+
   cloneNode(deep = false) {
     const copy = new this.constructor(this.tagName)
     copy.attributes = { ...this.attributes }
@@ -191,7 +239,10 @@ export class FakeNode {
 
   /** Deliver one event through capture, target, and bubble listeners. */
   dispatchEvent(event) {
-    event.target = this
+    // Defined rather than assigned: a real Event exposes `target` as a
+    // prototype getter, so assignment throws in strict mode, and the half
+    // dispatches genuine KeyboardEvents.
+    Object.defineProperty(event, 'target', { value: this, writable: true, configurable: true })
     event._stopped = false
     const path = []
     let node = this
@@ -311,7 +362,40 @@ export function installDom() {
       return []
     }
   }
+  installWindow()
   return document
+}
+
+/**
+ * Install the fake window, which the half reads for viewport size and listens
+ * to for the scroll/resize that re-run the Harness's own menu placement.
+ * @param options.width - the window's inner width.
+ * @param options.height - the window's inner height.
+ * @returns the fake window.
+ */
+export function installWindow({ width = 1200, height = 800 } = {}) {
+  const listeners = new Map()
+  const window = {
+    innerWidth: width,
+    innerHeight: height,
+    addEventListener(type, listener) {
+      listeners.set(type, (listeners.get(type) ?? []).concat(listener))
+    },
+    removeEventListener(type, listener) {
+      listeners.set(type, (listeners.get(type) ?? []).filter(entry => entry !== listener))
+    },
+    /** Deliver one event to this window's listeners, as a resize/scroll does. */
+    dispatchEvent(event) {
+      for (const listener of [...(listeners.get(event.type) ?? [])]) listener(event)
+      return true
+    },
+    /** How many listeners of one type are registered: disposal assertions read this. */
+    listenerCount(type) {
+      return (listeners.get(type) ?? []).length
+    },
+  }
+  globalThis.window = window
+  return window
 }
 
 /** One synthetic event with the members the half reads. */

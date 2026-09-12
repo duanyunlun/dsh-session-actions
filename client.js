@@ -4,15 +4,25 @@
  * The sidebar's Conversation rows are not extensible: `SessionNodeItem` builds
  * its own `Menu` items inline and registers no seat for a plugin to contribute
  * to, so this half decorates the rendered result instead of composing into it.
- * Three gestures are added:
+ * Four gestures are added:
  *
  *   1. double-clicking a row (outside its buttons) opens the **built-in**
  *      rename dialog, by calling the very `onRename` callback the row's own
  *      menu item calls — no second rename implementation exists;
- *   2. **Copy session ID** is appended to the row menu;
- *   3. **Delete session** is appended below it, styled destructive, and opens a
+ *   2. right-clicking a row opens that same built-in menu, by pressing the
+ *      trigger the row already renders, so no second menu exists either;
+ *   3. **Copy session ID** is appended to the row menu, and dismisses that menu
+ *      once the id is on the clipboard;
+ *   4. **Delete session** is appended below it, styled destructive, and opens a
  *      confirmation dialog that inspects the Conversation before offering the
- *      irreversible action.
+ *      irreversible action. On success the row leaves the list through the
+ *      Session store's own removal entry point, and deleting the Conversation
+ *      that is open returns the layout to its empty state.
+ *
+ * Appending rows makes the menu taller than the Harness measured it while
+ * placing it, so this half also re-places every menu it decorated from the
+ * card's real size — otherwise the last rows of a menu opened in the lower part
+ * of a short window fall below the fold.
  *
  * Every session id here comes from the React tree, never from the DOM text:
  * the row's own fiber carries the row props (`node`, `onRename`, `onArchive`),
@@ -61,12 +71,14 @@ window.__ModuleLoader__.load({
 		/** The two operations this half drives on the Host surface. */
 		const ROUTE_PREFIX = '/api2/dsh-session-actions'
 
-		/** How long a copied row keeps its confirmation label. */
-		const COPIED_LABEL_MS = 1200
+		/** Distance the Harness keeps between a menu card and the viewport edge. */
+		const MENU_MARGIN = 12
+
+		/** Distance the Harness keeps between a menu card and its trigger. */
+		const MENU_GAP = 4
 
 		const zh = {
 			copyId: '复制会话 ID',
-			copied: '已复制',
 			deleteSession: '删除会话',
 			deleteTitle: '永久删除会话',
 			deleteDesc: '“{title}”的对话记录、投影缓存与工作区记录将被永久删除，且无法恢复。',
@@ -76,16 +88,16 @@ window.__ModuleLoader__.load({
 			inspecting: '正在检查该会话…',
 			cancel: '取消',
 			close: '关闭',
-			blockedLive: '该会话当前在本应用进程中处于打开状态，无法彻底删除。请先重启 DSH，再执行删除。',
+			blockedRunning: '该会话正在运行中（有回合正在执行），此时删除会丢掉它正在写入的内容。请等这一轮结束后再删除。',
 			blockedMissing: '未在磁盘上找到该会话的记录，可能已被删除。',
 			detail: '将删除 {size} 数据，共 {count} 个目录。',
 			detailPath: '位置：{path}',
+			detailLoaded: '该会话当前处于打开状态：确认后它会立即从会话列表消失，进程内的副本在重启应用后彻底释放。',
 			failed: '删除失败：{message}',
 		}
 
 		const en = {
 			copyId: 'Copy session ID',
-			copied: 'Copied',
 			deleteSession: 'Delete session',
 			deleteTitle: 'Delete session permanently',
 			deleteDesc: '“{title}”, its transcript, its projection cache, and its workspace record will be permanently deleted. This cannot be undone.',
@@ -95,10 +107,11 @@ window.__ModuleLoader__.load({
 			inspecting: 'Inspecting this session…',
 			cancel: 'Cancel',
 			close: 'Close',
-			blockedLive: 'This session is open in the running application, so it cannot be removed completely. Restart DSH, then delete it.',
+			blockedRunning: 'This session is running a turn right now; deleting it would discard what that turn is writing. Wait for it to finish, then delete it.',
 			blockedMissing: 'No record of this session was found on disk; it may already be deleted.',
 			detail: 'Deletes {size} across {count} directories.',
 			detailPath: 'Location: {path}',
+			detailLoaded: 'This session is open right now: it leaves the list immediately, and the in-process copy is released when the app restarts.',
 			failed: 'Delete failed: {message}',
 		}
 
@@ -313,9 +326,11 @@ window.__ModuleLoader__.load({
 			 * The confirmation surface.
 			 *
 			 * It inspects the Conversation before offering the irreversible
-			 * action: a Session that is live in the Host process cannot be
-			 * removed completely, and saying so up front is better than
-			 * unlinking a log the running application still renders.
+			 * action: a Session whose Agent is running cannot be removed
+			 * without losing what that turn is writing, and saying so up front
+			 * is better than unlinking a log a running turn still appends to.
+			 * An attached-but-idle Session is deletable — the row leaves the
+			 * list with the storage.
 			 * @param props.request - the pending deletion.
 			 * @param props.onClose - withdraw the request.
 			 * @param props.onDeleted - the Conversation is gone; refresh the list.
@@ -337,8 +352,8 @@ window.__ModuleLoader__.load({
 							return
 						}
 						setReport(result.value)
-						setPhase(result.value.live === true
-							? 'blocked-live'
+						setPhase(result.value.running === true
+							? 'blocked-running'
 							: result.value.exists === true ? 'ready' : 'blocked-missing')
 					})()
 					return () => { cancelled = true }
@@ -354,7 +369,12 @@ window.__ModuleLoader__.load({
 							onDeleted()
 							return
 						}
-						setPhase(result.error?.code === 'session-live' ? 'blocked-live' : 'error')
+						// `session-live` is the code an older Host half answers
+						// with; both mean the same refusal to this surface.
+						const code = result.error?.code
+						setPhase(code === 'session-running' || code === 'session-live'
+							? 'blocked-running'
+							: 'error')
 						setMessage(result.error?.message ?? 'delete failed')
 					})()
 				}
@@ -366,12 +386,12 @@ window.__ModuleLoader__.load({
 				if (phase === 'deleting') {
 					body.push(h('div', { key: 'deleting', className: 'dsa-status', role: 'status' }, t('deletePending')))
 				}
-				if (phase === 'blocked-live' || phase === 'blocked-missing') {
+				if (phase === 'blocked-running' || phase === 'blocked-missing') {
 					body.push(h('div', {
 						key: 'blocked',
 						className: 'dsa-error',
 						role: 'alert',
-					}, phase === 'blocked-live' ? t('blockedLive') : t('blockedMissing')))
+					}, phase === 'blocked-running' ? t('blockedRunning') : t('blockedMissing')))
 				}
 				if (report !== null && (phase === 'ready' || phase === 'deleting')) {
 					body.push(h('div', { key: 'detail', className: 'dsa-detail' }, t('detail', {
@@ -382,6 +402,9 @@ window.__ModuleLoader__.load({
 						body.push(h('div', { key: 'path', className: 'dsa-detail' }, t('detailPath', {
 							path: report.directories[0],
 						})))
+					}
+					if (report.loaded === true) {
+						body.push(h('div', { key: 'loaded', className: 'dsa-detail' }, t('detailLoaded')))
 					}
 					body.push(h('div', { key: 'shared', className: 'dsa-detail' }, t('deleteShared')))
 				}
@@ -421,15 +444,107 @@ window.__ModuleLoader__.load({
 					onDeleted: () => {
 						pending = null
 						dialogRoot.render(null)
-						// The Host re-lists from storage on every pull, so the removed
-						// Conversation leaves the snapshot after this refresh.
-						ctx.sessions.refresh().catch(() => {})
+						const sessions = ctx.sessions
+						try {
+							// The conversation pane renders the *selection*, so deleting
+							// the Conversation that is open right now has to take the pane
+							// with it; the selection returns to the empty state.
+							if (sessions.list?.getSnapshot?.().current === sessionId) sessions.clear()
+							// Drive the Session store's own removal entry point — the very
+							// method the Host's `api-session/removed` frame calls — rather
+							// than wait for that frame and then re-pull: a re-pull merges
+							// the Host's baseline back in, so any row the Host still
+							// reports would return with it.
+							if (typeof sessions.handleSessionRemoved === 'function') {
+								sessions.handleSessionRemoved(sessionId)
+								return
+							}
+						} catch {
+							// The storage is already gone; a store that refuses the local
+							// removal still converges by re-reading the Host below.
+						}
+						sessions.refresh().catch(() => {})
 					},
 				}))
 			}
 
 			/** Menus this half decorated, so a re-render that dropped rows is repaired. */
 			const decorated = new Set()
+
+			/** The trigger each decorated menu was opened from, for re-placement. */
+			const anchors = new WeakMap()
+
+			/**
+			 * Where one menu belongs once its real size is known.
+			 *
+			 * The Harness places a portalled menu from the height it measures in
+			 * the commit that opens it — before this half appends its two rows —
+			 * so a menu opened from the lower part of a short window ends up
+			 * with its last rows below the fold. This restates that placement
+			 * (one gap below the trigger, one margin inside the viewport) using
+			 * the menu's actual size, and flips the card above the trigger when
+			 * the space below cannot hold it and the space above can.
+			 * @param anchor - the trigger button's client rect.
+			 * @param size - the menu's laid-out size.
+			 * @param viewport - the window's inner size.
+			 * @returns the fixed-position coordinates to apply.
+			 */
+			function menuPlacement(anchor, size, viewport) {
+				const below = anchor.bottom + MENU_GAP
+				const above = anchor.top - MENU_GAP - size.height
+				const top = below + size.height > viewport.height - MENU_MARGIN && above >= MENU_MARGIN
+					? above
+					: below
+				// A menu taller than the window stays at the top margin; its own
+				// max-height scrolls the overflow rather than pushing it off-screen.
+				return {
+					left: Math.min(
+						Math.max(anchor.left, MENU_MARGIN),
+						Math.max(viewport.width - size.width - MENU_MARGIN, MENU_MARGIN),
+					),
+					top: Math.min(
+						Math.max(top, MENU_MARGIN),
+						Math.max(viewport.height - size.height - MENU_MARGIN, MENU_MARGIN),
+					),
+				}
+			}
+
+			/**
+			 * Put one decorated menu where its real size allows.
+			 * @param menu - a decorated `role="menu"` element.
+			 */
+			function place(menu) {
+				const trigger = anchors.get(menu)
+				if (trigger === undefined || !trigger.isConnected) return
+				const width = menu.offsetWidth
+				const height = menu.offsetHeight
+				if (width === 0 || height === 0) return
+				const position = menuPlacement(
+					trigger.getBoundingClientRect(),
+					{ width, height },
+					{ width: window.innerWidth, height: window.innerHeight },
+				)
+				// `important` because the Harness owns these two properties on the
+				// same element and would otherwise win with its stale-height value.
+				menu.style.setProperty('left', `${position.left}px`, 'important')
+				menu.style.setProperty('top', `${position.top}px`, 'important')
+			}
+
+			/**
+			 * Re-place every decorated menu on the next macrotask.
+			 *
+			 * The Harness commits its own position from the pre-decoration
+			 * height, both when the menu opens and again on every scroll or
+			 * resize while it is open. Scheduling the correction means the write
+			 * that survives is this half's, whichever order the two land in.
+			 */
+			function replaceAll() {
+				setTimeout(() => {
+					for (const menu of decorated) {
+						if (menu.isConnected) place(menu)
+					}
+				}, 0)
+			}
 
 			/**
 			 * Append this half's rows to one rendered Conversation menu.
@@ -462,6 +577,17 @@ window.__ModuleLoader__.load({
 				if (menu.querySelector('[' + ACTION_ATTR + ']') === null) return
 				menu.setAttribute(MENU_ATTR, sessionId)
 				decorated.add(menu)
+				// Anchored on the row's own trigger, so the correction lands under
+				// the same card the Harness positioned; the marker above is written
+				// first so a second scan of this menu repairs rows, not placement.
+				const row = rowElementFor(sessionId)
+				const trigger = row === null ? null : menuTriggerOf(row)
+				if (trigger === null) return
+				anchors.set(menu, trigger)
+				place(menu)
+				// The Harness's own write for this open may still be in flight, so
+				// the correction is repeated once that task has settled.
+				replaceAll()
 			}
 
 			/** Guards the observer against the mutations this half's own decoration causes. */
@@ -492,6 +618,34 @@ window.__ModuleLoader__.load({
 			}
 
 			/**
+			 * One Escape keydown: the event the Harness's menu closes on.
+			 *
+			 * A real `KeyboardEvent` everywhere this half ships; the plain-`Event`
+			 * arm is for a host without the constructor (the `node:test` harness),
+			 * which still needs the `key` the listener reads.
+			 * @returns the event to dispatch.
+			 */
+			function escapeKeydown() {
+				return typeof KeyboardEvent === 'function'
+					? new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+					: Object.assign(new Event('keydown', { bubbles: true, cancelable: true }), { key: 'Escape' })
+			}
+
+			/**
+			 * Dismiss the menu one of this half's rows belongs to.
+			 *
+			 * The row component owns the menu's open state and listens for Escape
+			 * on the document, so this sends the gesture the user would send
+			 * instead of fabricating an outside click that other surfaces would
+			 * also see.
+			 * @param node - any node inside the menu to dismiss.
+			 */
+			function closeMenu(node) {
+				const holder = node.ownerDocument ?? document
+				holder.dispatchEvent(escapeKeydown())
+			}
+
+			/**
 			 * Handle one of this half's menu rows.
 			 * @param event - the captured click.
 			 * @returns whether the click belonged to this half.
@@ -503,12 +657,12 @@ window.__ModuleLoader__.load({
 				const sessionId = target.getAttribute(SESSION_ATTR)
 				if (sessionId === null) return false
 				if (action === 'copy') {
-					const label = slotsOf(target).label
 					primitives.writeClipboard(sessionId).then((written) => {
-						if (!written || label === null) return
-						const original = label.textContent
-						label.textContent = t('copied')
-						setTimeout(() => { label.textContent = original }, COPIED_LABEL_MS)
+						// The menu has done its job. A menu that stays open after a
+						// copy is one the user has to dismiss by hand, so a successful
+						// copy dismisses it — and a failed one leaves it, so the row is
+						// still there to try again.
+						if (written) closeMenu(target)
 					}).catch(() => {})
 					return true
 				}
@@ -544,6 +698,67 @@ window.__ModuleLoader__.load({
 				props.onRename(props.node.id, props.node.title)
 			}
 
+			/**
+			 * The row's own menu trigger, found structurally.
+			 *
+			 * The menu's classes are CSS-module hashes this half cannot name, so
+			 * the trigger is located by position: `rowActions` is the last cell
+			 * of a Conversation row, and its only button is the one the
+			 * Harness's own menu anchors to.
+			 * @param row - the rendered `role="treeitem"` row.
+			 * @returns the trigger button, or null when the row has none.
+			 */
+			function menuTriggerOf(row) {
+				const buttons = row.querySelectorAll('button')
+				return buttons.length === 0 ? null : buttons[buttons.length - 1]
+			}
+
+			/**
+			 * The rendered row of one Conversation, located through the rows' own
+			 * props because the markup carries no id attribute to read.
+			 *
+			 * Queried from `body`: the sidebar is rendered inside it, and a
+			 * conversation row is never portalled anywhere else.
+			 * @param sessionId - the Conversation to find.
+			 * @returns the row element, or null when it is not rendered.
+			 */
+			function rowElementFor(sessionId) {
+				for (const row of document.body.querySelectorAll('[role="treeitem"]')) {
+					const props = rowPropsFrom(row)
+					if (props !== null && props.node.id === sessionId) return row
+				}
+				return null
+			}
+
+			/**
+			 * Open a Conversation's own menu from a right-click anywhere on its row.
+			 *
+			 * The menu is opened by pressing the trigger the Harness rendered,
+			 * so every item — rename, fork, archive, and this half's two — stays
+			 * exactly the one built-in menu; nothing is re-implemented and no
+			 * second menu exists to drift. The native browser menu is suppressed
+			 * in exchange, which is the point of claiming the gesture.
+			 *
+			 * A press always toggles from the closed state: the right-click's own
+			 * `pointerdown` has already closed any menu that was open (the
+			 * Harness closes on outside pointerdown), so the toggle this
+			 * dispatches can only open one.
+			 * @param event - the captured context-menu event.
+			 */
+			function onContextMenu(event) {
+				const target = event.target instanceof Element ? event.target : null
+				if (target === null || target.closest('[role="menu"]') !== null) return
+				const row = target.closest('[role="treeitem"]')
+				if (row === null) return
+				const props = rowPropsFrom(row)
+				// A blank row renders no menu and has no verbs to offer.
+				if (props === null || props.node.blank === true) return
+				const trigger = menuTriggerOf(row)
+				if (trigger === null) return
+				event.preventDefault()
+				trigger.click()
+			}
+
 			const observer = new MutationObserver((records) => {
 				for (const record of records) for (const node of record.addedNodes) scan(node)
 			})
@@ -551,11 +766,17 @@ window.__ModuleLoader__.load({
 			for (const menu of document.querySelectorAll('[role="menu"]')) scan(menu)
 			document.addEventListener('click', onClick, true)
 			document.addEventListener('dblclick', onDoubleClick, true)
+			document.addEventListener('contextmenu', onContextMenu, true)
+			window.addEventListener('scroll', replaceAll, true)
+			window.addEventListener('resize', replaceAll)
 
 			ctx.effect(() => () => {
 				observer.disconnect()
 				document.removeEventListener('click', onClick, true)
 				document.removeEventListener('dblclick', onDoubleClick, true)
+				document.removeEventListener('contextmenu', onContextMenu, true)
+				window.removeEventListener('scroll', replaceAll, true)
+				window.removeEventListener('resize', replaceAll)
 				dialogRoot.unmount()
 				dialogHost.remove()
 				style.remove()

@@ -13,12 +13,13 @@
  * CORS preflight that this route never answers, so a page on another origin
  * cannot drive a delete even though it can reach the loopback port.
  *
- * A Conversation that is live in this process is refused rather than deleted.
- * Its log writer still holds an open handle and the Agent that owns it is
- * registered for the process lifetime, so unlinking the log would leave a row
- * the Client keeps rendering from memory while the storage underneath it no
- * longer exists. Refusing is recoverable; a half-deleted live Conversation is
- * not.
+ * A Conversation that is **running** — an Agent executing a turn for it right
+ * now — is refused rather than deleted: the turn would keep appending to a log
+ * this surface just unlinked, and the user would lose both the answer and the
+ * record of the question. An attached but idle Conversation is deleted
+ * normally; the row leaves the sidebar with the storage because the Host
+ * forwards `api-session/removed` to the browser, which is the same signal a
+ * disposed Session emits.
  *
  * @module dsh-session-actions
  */
@@ -97,18 +98,56 @@ async function readJsonBody(req) {
 }
 
 /**
- * Whether one Conversation is live in this process.
+ * Whether one Conversation is attached to this process.
  *
- * Read through `ctx.get` rather than a declared injection: this plugin is
- * useful with no Session service present (it then only ever reports `false`),
- * and an injection would leave the whole plugin PENDING there.
+ * Attachment is what keeps a row rendering from memory after its log is gone,
+ * so the confirmation surface reports it; it is not by itself a reason to
+ * refuse. Read through `ctx.get` rather than a declared injection: this plugin
+ * is useful with no Session service present (it then only ever reports
+ * `false`), and an injection would leave the whole plugin PENDING there.
  * @param ctx - Host plugin context.
  * @param sessionId - the Session to test.
- * @returns true when a live Session owns the id.
+ * @returns true when this process holds the Session.
  */
-function isLive(ctx, sessionId) {
+function isLoaded(ctx, sessionId) {
   const sessions = ctx.get('sessions')
   return sessions !== undefined && sessions.get(sessionId) !== undefined
+}
+
+/**
+ * Whether one Conversation is executing a turn right now.
+ *
+ * `agent/status` is the Host's own definition of running (`idle` ⇄ `running`)
+ * and the same source the sidebar's running indicator reads, so the guard and
+ * the UI can never disagree.
+ * @param ctx - Host plugin context.
+ * @param sessionId - the Session to test.
+ * @returns true when an Agent is running for this Session.
+ */
+function isRunning(ctx, sessionId) {
+  const agents = ctx.get('agents')
+  const agent = agents === undefined ? undefined : agents.get(sessionId)
+  return agent !== undefined && agent !== null && agent.status === 'running'
+}
+
+/**
+ * Tell the browser this Conversation left the Session list.
+ *
+ * `api-session/removed` is the Host event the Client's Session store already
+ * consumes to drop a row, and it is on the forwarded-event allowlist, so
+ * emitting it here is the same signal a disposed Session produces — without
+ * claiming an Agent capability this plugin does not own. A listener failure is
+ * contained: the storage is already gone, and the browser's own list refresh
+ * still converges.
+ * @param ctx - Host plugin context.
+ * @param sessionId - the removed Session.
+ */
+function announceRemoval(ctx, sessionId) {
+  try {
+    ctx.emit('api-session/removed', sessionId)
+  } catch (error) {
+    ctx.logger?.warn?.(new Error(`dsh-session-actions: api-session/removed listener failed: ${String(error)}`))
+  }
 }
 
 /**
@@ -155,25 +194,29 @@ function createHandler(ctx, op) {
       const body = await readJsonBody(req)
       const sessionId = requireSessionId(body)
       const home = resolveHome(ctx)
-      const live = isLive(ctx, sessionId)
+      const loaded = isLoaded(ctx, sessionId)
+      const running = isRunning(ctx, sessionId)
       if (op === 'inspect') {
         const report = await inspectSession(home, sessionId)
-        respond(200, { ok: true, value: { sessionId, live, ...report } })
+        // `live` is kept as an alias of `loaded`: a browser half cached from an
+        // older package reads it, and the two never disagreed.
+        respond(200, { ok: true, value: { sessionId, loaded, running, live: loaded, ...report } })
         return
       }
-      if (live) {
+      if (running) {
         respond(409, {
           ok: false,
           error: {
-            code: 'session-live',
-            message: `session "${sessionId}" is open in this process`,
+            code: 'session-running',
+            message: `session "${sessionId}" is running a turn in this process`,
             sessionId,
           },
         })
         return
       }
       const report = await removeSession(home, sessionId)
-      respond(200, { ok: true, value: { sessionId, ...report } })
+      announceRemoval(ctx, sessionId)
+      respond(200, { ok: true, value: { sessionId, loaded, ...report } })
     } catch (error) {
       respond(400, {
         ok: false,

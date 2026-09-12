@@ -17,7 +17,7 @@
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { installDom, makeEvent } from './fake-dom.mjs'
+import { installDom, installWindow, makeEvent } from './fake-dom.mjs'
 
 const SESSION = 'session-11111111-2222-3333-4444-555555555555'
 const FIBER_KEY = '__reactFiber$test'
@@ -156,6 +156,9 @@ function makeRequire(react, renderer, options) {
     IconCopyOutline16: () => react.React.createElement('svg', { 'data-icon': 'copy' }),
     IconTrashOutline16: () => react.React.createElement('svg', { 'data-icon': 'trash' }),
     writeClipboard: (text) => {
+      // A denied write answers false, the way the real primitive reports a
+      // refused permission instead of throwing.
+      if (options.denyClipboard === true) return Promise.resolve(false)
       options.clipboard.push(text)
       return Promise.resolve(true)
     },
@@ -186,7 +189,10 @@ function makeRequire(react, renderer, options) {
 /** Load the browser half and return the plugin face it registers. */
 async function loadPlugin(require) {
   let captured = null
-  globalThis.window = { __ModuleLoader__: { load: (spec) => { captured = spec } } }
+  globalThis.window = {
+    ...(globalThis.window ?? {}),
+    __ModuleLoader__: { load: (spec) => { captured = spec } },
+  }
   await import(`../client.js?cachebust=${Math.random()}`)
   assert.notEqual(captured, null, 'the half must register itself on the module queue')
   return { spec: captured, face: captured.factory(require) }
@@ -254,8 +260,28 @@ function makeMenu(document, rowFiber, labels = ['重命名', '分叉会话', '�
 }
 
 /** A browser context exposing only what the half reads. */
-function makeCtx() {
-  const state = { refreshed: 0, cleanups: [], dictionary: null }
+function makeCtx(options = {}) {
+  const state = {
+    refreshed: 0,
+    cleared: 0,
+    removed: [],
+    current: undefined,
+    cleanups: [],
+    dictionary: null,
+  }
+  const sessions = {
+    refresh: () => { state.refreshed += 1; return Promise.resolve() },
+    clear: () => { state.cleared += 1 },
+    list: { getSnapshot: () => ({ current: state.current }) },
+  }
+  // The Session store's removal entry point. A deployment without it exercises
+  // the re-pull fallback, so the stub can drop it.
+  if (options.withoutRemoval !== true) {
+    sessions.handleSessionRemoved = (sessionId) => {
+      if (options.removalThrows === true) throw new Error('store refused the removal')
+      state.removed.push(sessionId)
+    }
+  }
   const ctx = {
     effect(fn) {
       const dispose = fn()
@@ -277,7 +303,7 @@ function makeCtx() {
         }
       },
     },
-    sessions: { refresh: () => { state.refreshed += 1; return Promise.resolve() } },
+    sessions,
   }
   return { ctx, state }
 }
@@ -292,7 +318,8 @@ function stubFetch(options) {
       return { status: 200, json: async () => ({ ok: true, value: options.inspect }) }
     }
     if (options.deleteFails === true) {
-      return { status: 409, json: async () => ({ ok: false, error: { code: 'session-live', message: 'live' } }) }
+      const code = options.deleteErrorCode ?? 'session-running'
+      return { status: 409, json: async () => ({ ok: false, error: { code, message: code } }) }
     }
     return { status: 200, json: async () => ({ ok: true, value: { sessionId: SESSION, freedBytes: 2048 } }) }
   }
@@ -302,14 +329,16 @@ function stubFetch(options) {
 /** Boot the half against a fresh fake page. */
 async function boot(options = {}) {
   const document = installDom()
+  const window = installWindow(options.viewport)
   const react = makeReact()
   const renderer = makeRenderer(react, document)
   const clipboard = []
-  const require = makeRequire(react, renderer, { clipboard })
+  const clipboardOptions = { clipboard, denyClipboard: false }
+  const require = makeRequire(react, renderer, clipboardOptions)
   const { face } = await loadPlugin(require)
-  const { ctx, state } = makeCtx()
+  const { ctx, state } = makeCtx(options)
   face.apply(ctx)
-  return { document, face, ctx, state, clipboard, renderer }
+  return { document, window, face, ctx, state, clipboard, clipboardOptions, renderer }
 }
 
 /** Let the confirmation flow's awaited Host calls settle. */
@@ -369,9 +398,13 @@ test('a Workspace row menu is never decorated', async (t) => {
   assert.deepEqual(menu.querySelectorAll('[data-dsa-action]'), [])
 })
 
-test('Copy session ID writes the row id and confirms in place', async (t) => {
+test('Copy session ID writes the row id and dismisses the menu', async (t) => {
   const { document, state, clipboard } = await boot()
   t.after(() => { for (const dispose of state.cleanups) dispose() })
+  // The Harness's menu closes on the Escape the document receives; this stands
+  // in for that listener, which the fake DOM has no React tree to install.
+  const keys = []
+  document.addEventListener('keydown', (event) => { keys.push(event.key) })
   const row = makeRow(document, {})
   document.body.appendChild(row.row)
   const menu = makeMenu(document, row.rowFiber)
@@ -380,13 +413,29 @@ test('Copy session ID writes the row id and confirms in place', async (t) => {
   copy.dispatchEvent(makeEvent('click'))
   await settle()
   assert.deepEqual(clipboard, [SESSION])
-  assert.equal(copy.textContent.includes(state.dictionary.zh.copied), true)
+  assert.deepEqual(keys, ['Escape'], 'the menu is dismissed once the id is copied')
+})
+
+test('a failed copy leaves the menu open to try again', async (t) => {
+  const { document, state, clipboardOptions } = await boot()
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  const keys = []
+  document.addEventListener('keydown', (event) => { keys.push(event.key) })
+  const row = makeRow(document, {})
+  document.body.appendChild(row.row)
+  const menu = makeMenu(document, row.rowFiber)
+  document.body.appendChild(menu)
+  // The clipboard refuses this write, the way a denied permission does.
+  clipboardOptions.denyClipboard = true
+  menu.querySelector('[data-dsa-action="copy"]').dispatchEvent(makeEvent('click'))
+  await settle()
+  assert.deepEqual(keys, [], 'nothing was copied, so the row stays for another try')
 })
 
 test('Delete session confirms before it destroys anything', async (t) => {
   const { document, state } = await boot()
   t.after(() => { for (const dispose of state.cleanups) dispose() })
-  const calls = stubFetch({ inspect: { sessionId: SESSION, live: false, exists: true, sizeBytes: 2048, directories: ['/home/.dsh/sessions/p/' + SESSION] } })
+  const calls = stubFetch({ inspect: { sessionId: SESSION, loaded: false, running: false, exists: true, sizeBytes: 2048, directories: ['/home/.dsh/sessions/p/' + SESSION] } })
   const row = makeRow(document, { title: 'Old chat' })
   document.body.appendChild(row.row)
   const menu = makeMenu(document, row.rowFiber)
@@ -416,13 +465,14 @@ test('Delete session confirms before it destroys anything', async (t) => {
     '/api2/dsh-session-actions/inspect',
     '/api2/dsh-session-actions/delete',
   ])
-  assert.equal(state.refreshed, 1, 'the list is refreshed so the row disappears')
+  assert.deepEqual(state.removed, [SESSION], 'the list drops the row through its own removal path')
+  assert.equal(state.refreshed, 0, 'a re-pull would merge the Host baseline back in')
 })
 
-test('a live Conversation is reported as undeletable and the action stays disabled', async (t) => {
+test('a Conversation that is only attached is deletable, and the dialog says so', async (t) => {
   const { document, state } = await boot()
   t.after(() => { for (const dispose of state.cleanups) dispose() })
-  const calls = stubFetch({ inspect: { sessionId: SESSION, live: true, exists: true, sizeBytes: 10, directories: [] } })
+  const calls = stubFetch({ inspect: { sessionId: SESSION, loaded: true, running: false, exists: true, sizeBytes: 10, directories: ['/home/.dsh/sessions/p/' + SESSION] } })
   const row = makeRow(document, {})
   document.body.appendChild(row.row)
   const menu = makeMenu(document, row.rowFiber)
@@ -431,7 +481,31 @@ test('a live Conversation is reported as undeletable and the action stays disabl
   await settle()
 
   const dialog = document.body.querySelector('[role="dialog"]')
-  assert.equal(dialog.textContent.includes(state.dictionary.zh.blockedLive), true)
+  const confirm = dialog.querySelectorAll('button')[1]
+  assert.equal(confirm.hasAttribute('disabled'), false)
+  assert.equal(dialog.textContent.includes(state.dictionary.zh.detailLoaded), true)
+  confirm.dispatchEvent(makeEvent('click'))
+  await settle()
+  assert.deepEqual(calls.map(entry => entry.url), [
+    '/api2/dsh-session-actions/inspect',
+    '/api2/dsh-session-actions/delete',
+  ])
+  assert.deepEqual(state.removed, [SESSION])
+})
+
+test('a running Conversation is reported as undeletable and the action stays disabled', async (t) => {
+  const { document, state } = await boot()
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  const calls = stubFetch({ inspect: { sessionId: SESSION, loaded: true, running: true, exists: true, sizeBytes: 10, directories: [] } })
+  const row = makeRow(document, {})
+  document.body.appendChild(row.row)
+  const menu = makeMenu(document, row.rowFiber)
+  document.body.appendChild(menu)
+  menu.querySelector('[data-dsa-action="delete"]').dispatchEvent(makeEvent('click'))
+  await settle()
+
+  const dialog = document.body.querySelector('[role="dialog"]')
+  assert.equal(dialog.textContent.includes(state.dictionary.zh.blockedRunning), true)
   const confirm = dialog.querySelectorAll('button')[1]
   assert.equal(confirm.hasAttribute('disabled'), true)
   confirm.dispatchEvent(makeEvent('click'))
@@ -443,7 +517,7 @@ test('a rejected delete keeps the dialog open with the failure', async (t) => {
   const { document, state } = await boot()
   t.after(() => { for (const dispose of state.cleanups) dispose() })
   const calls = stubFetch({
-    inspect: { sessionId: SESSION, live: false, exists: true, sizeBytes: 10, directories: [] },
+    inspect: { sessionId: SESSION, loaded: false, running: false, exists: true, sizeBytes: 10, directories: [] },
     deleteFails: true,
   })
   const row = makeRow(document, {})
@@ -457,8 +531,240 @@ test('a rejected delete keeps the dialog open with the failure', async (t) => {
   assert.equal(calls.length, 2)
   const dialog = document.body.querySelector('[role="dialog"]')
   assert.notEqual(dialog, null)
-  assert.equal(dialog.textContent.includes(state.dictionary.zh.blockedLive), true)
+  assert.equal(dialog.textContent.includes(state.dictionary.zh.blockedRunning), true)
   assert.equal(state.refreshed, 0)
+})
+
+test('a turn that started between inspect and confirm is reported as running', async (t) => {
+  const { document, state } = await boot()
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  // The Host half answers this code; the row was idle when it was inspected,
+  // so only the delete itself can discover the turn.
+  const calls = stubFetch({
+    inspect: { sessionId: SESSION, loaded: true, running: false, exists: true, sizeBytes: 10, directories: [] },
+    deleteFails: true,
+  })
+  const row = makeRow(document, {})
+  document.body.appendChild(row.row)
+  const menu = makeMenu(document, row.rowFiber)
+  document.body.appendChild(menu)
+  menu.querySelector('[data-dsa-action="delete"]').dispatchEvent(makeEvent('click'))
+  await settle()
+  document.body.querySelector('[role="dialog"]').querySelectorAll('button')[1].dispatchEvent(makeEvent('click'))
+  await settle()
+  assert.equal(calls.length, 2)
+  assert.equal(document.body.querySelector('[role="dialog"]').textContent.includes(state.dictionary.zh.blockedRunning), true)
+  assert.equal(state.refreshed, 0)
+})
+
+test('the renamed refusal code from an older Host half still blocks the action', async (t) => {
+  const { document, state } = await boot()
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  const calls = stubFetch({
+    inspect: { sessionId: SESSION, loaded: true, running: false, exists: true, sizeBytes: 10, directories: [] },
+    deleteFails: true,
+    deleteErrorCode: 'session-live',
+  })
+  const row = makeRow(document, {})
+  document.body.appendChild(row.row)
+  const menu = makeMenu(document, row.rowFiber)
+  document.body.appendChild(menu)
+  menu.querySelector('[data-dsa-action="delete"]').dispatchEvent(makeEvent('click'))
+  await settle()
+  document.body.querySelector('[role="dialog"]').querySelectorAll('button')[1].dispatchEvent(makeEvent('click'))
+  await settle()
+  assert.equal(calls.length, 2)
+  assert.equal(document.body.querySelector('[role="dialog"]').textContent.includes(state.dictionary.zh.blockedRunning), true)
+  assert.equal(state.refreshed, 0)
+})
+
+test('deleting the Conversation that is open clears the selection', async (t) => {
+  const { document, state } = await boot()
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  state.current = SESSION
+  stubFetch({ inspect: { sessionId: SESSION, loaded: true, running: false, exists: true, sizeBytes: 10, directories: [] } })
+  const row = makeRow(document, {})
+  document.body.appendChild(row.row)
+  const menu = makeMenu(document, row.rowFiber)
+  document.body.appendChild(menu)
+  menu.querySelector('[data-dsa-action="delete"]').dispatchEvent(makeEvent('click'))
+  await settle()
+  document.body.querySelector('[role="dialog"]').querySelectorAll('button')[1].dispatchEvent(makeEvent('click'))
+  await settle()
+  // The pane renders the selection, so a removed row must not stay selected.
+  assert.equal(state.cleared, 1)
+  assert.deepEqual(state.removed, [SESSION])
+})
+
+test('deleting some other Conversation leaves the selection alone', async (t) => {
+  const { document, state } = await boot()
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  state.current = 'session-99999999-8888-7777-6666-555555555555'
+  stubFetch({ inspect: { sessionId: SESSION, loaded: false, running: false, exists: true, sizeBytes: 10, directories: [] } })
+  const row = makeRow(document, {})
+  document.body.appendChild(row.row)
+  const menu = makeMenu(document, row.rowFiber)
+  document.body.appendChild(menu)
+  menu.querySelector('[data-dsa-action="delete"]').dispatchEvent(makeEvent('click'))
+  await settle()
+  document.body.querySelector('[role="dialog"]').querySelectorAll('button')[1].dispatchEvent(makeEvent('click'))
+  await settle()
+  assert.equal(state.cleared, 0)
+  assert.deepEqual(state.removed, [SESSION])
+})
+
+test('a store that rejects the local removal still converges by re-pulling', async (t) => {
+  const { document, state } = await boot({ removalThrows: true })
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  stubFetch({ inspect: { sessionId: SESSION, loaded: false, running: false, exists: true, sizeBytes: 10, directories: [] } })
+  const row = makeRow(document, {})
+  document.body.appendChild(row.row)
+  const menu = makeMenu(document, row.rowFiber)
+  document.body.appendChild(menu)
+  menu.querySelector('[data-dsa-action="delete"]').dispatchEvent(makeEvent('click'))
+  await settle()
+  document.body.querySelector('[role="dialog"]').querySelectorAll('button')[1].dispatchEvent(makeEvent('click'))
+  await settle()
+  assert.deepEqual(state.removed, [])
+  assert.equal(state.refreshed, 1)
+})
+
+test('a Session store without its removal entry point falls back to a re-pull', async (t) => {
+  const { document, state } = await boot({ withoutRemoval: true })
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  stubFetch({ inspect: { sessionId: SESSION, loaded: false, running: false, exists: true, sizeBytes: 10, directories: [] } })
+  const row = makeRow(document, {})
+  document.body.appendChild(row.row)
+  const menu = makeMenu(document, row.rowFiber)
+  document.body.appendChild(menu)
+  menu.querySelector('[data-dsa-action="delete"]').dispatchEvent(makeEvent('click'))
+  await settle()
+  document.body.querySelector('[role="dialog"]').querySelectorAll('button')[1].dispatchEvent(makeEvent('click'))
+  await settle()
+  assert.deepEqual(state.removed, [])
+  assert.equal(state.refreshed, 1)
+})
+
+test('a decorated menu is re-placed so its added rows stay inside the window', async (t) => {
+  // A short window: the Harness placed the three-row menu from the height it
+  // had before this half appended two more, so without a correction the card
+  // would end below the fold.
+  const { document, state } = await boot({ viewport: { width: 1200, height: 300 } })
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  const row = makeRow(document, {})
+  document.body.appendChild(row.row)
+  row.button.rect = { left: 300, top: 240, right: 320, bottom: 268, width: 20, height: 28 }
+  const menu = makeMenu(document, row.rowFiber)
+  menu.rect = { left: 300, top: 272, right: 520, bottom: 452, width: 220, height: 180 }
+  document.body.appendChild(menu)
+
+  // No room below the trigger (272 + 180 > 300 - 12), but room above it, so the
+  // card flips above: 240 - 4 - 180.
+  assert.equal(menu.style.getPropertyValue('top'), '56px')
+  assert.equal(menu.style.getPropertyPriority('top'), 'important')
+  assert.equal(menu.style.getPropertyValue('left'), '300px')
+})
+
+test('a menu with room below stays under its trigger', async (t) => {
+  const { document, state } = await boot({ viewport: { width: 1200, height: 800 } })
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  const row = makeRow(document, {})
+  document.body.appendChild(row.row)
+  row.button.rect = { left: 300, top: 100, right: 320, bottom: 128, width: 20, height: 28 }
+  const menu = makeMenu(document, row.rowFiber)
+  menu.rect = { left: 300, top: 132, right: 520, bottom: 312, width: 220, height: 180 }
+  document.body.appendChild(menu)
+  assert.equal(menu.style.getPropertyValue('top'), '132px')
+  assert.equal(menu.style.getPropertyValue('left'), '300px')
+})
+
+test('a menu taller than the window is pinned to the top margin', async (t) => {
+  const { document, state } = await boot({ viewport: { width: 400, height: 300 } })
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  const row = makeRow(document, {})
+  document.body.appendChild(row.row)
+  row.button.rect = { left: 380, top: 100, right: 400, bottom: 128, width: 20, height: 28 }
+  const menu = makeMenu(document, row.rowFiber)
+  // Taller than the window and wider than the space left of the trigger: the
+  // card's own max-height scrolls, and the clamp keeps it against the margins.
+  menu.rect = { left: 180, top: 132, right: 400, bottom: 532, width: 220, height: 400 }
+  document.body.appendChild(menu)
+  assert.equal(menu.style.getPropertyValue('top'), '12px')
+  assert.equal(menu.style.getPropertyValue('left'), '168px')
+})
+
+test('an unmeasurable menu is left where the Harness put it', async (t) => {
+  const { document, state } = await boot()
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  const row = makeRow(document, {})
+  document.body.appendChild(row.row)
+  // No declared box: reading a position here would be guesswork.
+  const menu = makeMenu(document, row.rowFiber)
+  document.body.appendChild(menu)
+  assert.equal(menu.querySelectorAll('[data-dsa-action]').length, 2)
+  assert.equal(menu.style.getPropertyValue('top'), '')
+  assert.equal(menu.style.getPropertyValue('left'), '')
+})
+
+test('right-clicking a row opens that row\u2019s own menu and suppresses the native one', async (t) => {
+  const { document, state } = await boot()
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  const row = makeRow(document, { title: 'Right me' })
+  document.body.appendChild(row.row)
+  const pressed = []
+  row.button.addEventListener('click', () => { pressed.push('menu') })
+
+  const event = makeEvent('contextmenu')
+  row.titleSpan.dispatchEvent(event)
+  assert.deepEqual(pressed, ['menu'], 'the Harness\u2019s own trigger is the only menu opened')
+  assert.equal(event.defaultPrevented, true, 'the browser menu is replaced, not shown alongside')
+})
+
+test('right-clicking the row\u2019s own button opens the menu once, not twice', async (t) => {
+  const { document, state } = await boot()
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  const row = makeRow(document, {})
+  document.body.appendChild(row.row)
+  const pressed = []
+  row.button.addEventListener('click', () => { pressed.push('menu') })
+  row.button.dispatchEvent(makeEvent('contextmenu'))
+  assert.deepEqual(pressed, ['menu'])
+})
+
+test('right-clicking a blank New Session row or a non-row is ignored', async (t) => {
+  const { document, state } = await boot()
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  const blank = makeRow(document, { title: '新会话', blank: true })
+  document.body.appendChild(blank.row)
+  const pressed = []
+  blank.button.addEventListener('click', () => { pressed.push('menu') })
+
+  const onBlank = makeEvent('contextmenu')
+  blank.titleSpan.dispatchEvent(onBlank)
+  assert.deepEqual(pressed, [])
+  assert.equal(onBlank.defaultPrevented, false, 'outside a Conversation row the native menu is untouched')
+
+  const orphan = document.createElement('span')
+  document.body.appendChild(orphan)
+  const onOrphan = makeEvent('contextmenu')
+  orphan.dispatchEvent(onOrphan)
+  assert.equal(onOrphan.defaultPrevented, false)
+})
+
+test('right-clicking inside an open menu leaves it alone', async (t) => {
+  const { document, state } = await boot()
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  const row = makeRow(document, {})
+  document.body.appendChild(row.row)
+  const pressed = []
+  row.button.addEventListener('click', () => { pressed.push('menu') })
+  const menu = makeMenu(document, row.rowFiber)
+  document.body.appendChild(menu)
+
+  const event = makeEvent('contextmenu')
+  menu.querySelector('[role="menuitem"]').dispatchEvent(event)
+  assert.deepEqual(pressed, [], 'the menu the user is pointing at is not toggled shut')
+  assert.equal(event.defaultPrevented, false)
 })
 
 test('double-clicking a row opens the built-in rename dialog through the row props', async (t) => {

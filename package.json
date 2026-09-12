@@ -1,0 +1,53 @@
+{
+  "name": "dsh-session-actions",
+  "version": "0.1.0",
+  "description": "Sidebar Conversation actions for DeepSeek Harness: double-click to rename, copy the session ID, and permanently delete a Conversation with its storage.",
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "plugin",
+    "session",
+    "conversation",
+    "delete",
+    "rename",
+    "sidebar"
+  ],
+  "license": "MIT",
+  "author": "duanyunlun",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/duanyunlun/dsh-session-actions.git"
+  },
+  "homepage": "https://github.com/duanyunlun/dsh-session-actions#readme",
+  "bugs": {
+    "url": "https://github.com/duanyunlun/dsh-session-actions/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "session-files.js",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "test": "node --test 'test/*.test.mjs'"
+  }
+}

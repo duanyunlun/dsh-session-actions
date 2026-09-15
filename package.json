@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-actions",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Sidebar Conversation actions for DeepSeek Harness: double-click to rename, copy the session ID, and permanently delete a Conversation with its storage.",
   "keywords": [
     "deepseek",
@@ -35,11 +35,15 @@
     "index.js",
     "client.js",
     "session-files.js",
+    "cordis.patch.yml",
     "README.md",
     "README.en.md",
     "LICENSE"
   ],
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web"
     }

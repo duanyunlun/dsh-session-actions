@@ -30,11 +30,25 @@ a session the list no longer has.
 
 ## Install
 
+This package is a **DSH bundle**: its manifest declares `dsh.bundle.patch`,
+pointing at the `cordis.patch.yml` it ships. There are two ways to install it —
+**pick one, never both**:
+
+**Recommended: install it as a bundle** (the community market's Install button,
+or by hand)
+
 ```sh
-npm install dsh-session-actions
+dsh plugin --profile desktop add dsh-session-actions
 ```
 
-Then add an insert row to the DSH profile's `cordis.patch.yml` (for example
+The package then appears in the profile's `dsh.profile.bundles`, and its patch
+layer inserts the Loader row at startup, so no profile file needs editing. The
+market verifies the `dsh.bundle.patch` declaration against npm before it
+installs and refuses a package without one.
+
+**Or: add the insert row by hand** (for a profile that does not use bundles)
+
+In the DSH profile's `cordis.patch.yml` (for example
 `$DSH_HOME/profiles/desktop/cordis.patch.yml`):
 
 ```yaml
@@ -42,6 +56,10 @@ Then add an insert row to the DSH profile's `cordis.patch.yml` (for example
     - id: session-actions
       name: 'dsh-session-actions'
 ```
+
+⚠️ If the profile already lists this package in `dsh.profile.bundles`, do
+**not** also add that row: the plugin would load twice (the Host half fails on
+a duplicate route registration, and the menu rows appear twice).
 
 The package declares `dsh.client.platform: web` and ships both halves
 (`index.js` for the Host, `client.js` for the browser) with no build step.

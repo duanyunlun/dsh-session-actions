@@ -19,17 +19,27 @@ DSH 内置的会话菜单只有 **重命名 / 分叉会话 / 归档会话**，�
 
 ## 安装
 
+本包是一个 **DSH bundle**（`package.json` 里声明了 `dsh.bundle.patch` → 包内的 `cordis.patch.yml`）。因此有两种装法，**二选一，不要同时用**：
+
+**推荐：作为 bundle 安装**（社区市场 / 插件管理器点「安装」，或手动）
+
 ```sh
-npm install dsh-session-actions
+dsh plugin --profile desktop add dsh-session-actions
 ```
 
-然后在 DSH profile 的 `cordis.patch.yml`（例如 `$DSH_HOME/profiles/desktop/cordis.patch.yml`）里加一行 insert：
+装好后该包会出现在 profile 的 `dsh.profile.bundles` 里，它的 patch 层会在启动时自动插入 Loader 行，不需要你再改任何文件。市场安装前会从 npm 校验这个包确实声明了 `dsh.bundle.patch`，缺少声明会被直接拒绝。
+
+**或者：手动加一行 insert**（profile 不用 bundles 的场合）
+
+在 DSH profile 的 `cordis.patch.yml`（例如 `$DSH_HOME/profiles/desktop/cordis.patch.yml`）里加：
 
 ```yaml
 - insert:
     - id: session-actions
       name: 'dsh-session-actions'
 ```
+
+⚠️ 如果 profile 已经把本包装进 `dsh.profile.bundles`，就**不要**再写这行 insert —— 那会把插件加载两次（宿主半边会因路由重复注册报错，界面上的菜单项也会重复）。
 
 `dsh.client.platform` 已声明为 `web`，插件包同时提供宿主半边（`index.js`）和浏览器半边（`client.js`），无需构建步骤。
 

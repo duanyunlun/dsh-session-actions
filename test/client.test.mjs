@@ -513,6 +513,38 @@ test('a running Conversation is reported as undeletable and the action stays dis
   assert.deepEqual(calls.map(entry => entry.url), ['/api2/dsh-session-actions/inspect'])
 })
 
+test('a row whose storage is gone is still removable from the list', async (t) => {
+  const { document, state } = await boot()
+  t.after(() => { for (const dispose of state.cleanups) dispose() })
+  // The log was deleted outside this surface: the row is the only thing left,
+  // and it must not survive as a dialog the user can never confirm.
+  const calls = stubFetch({
+    inspect: { sessionId: SESSION, loaded: true, running: false, exists: false, sizeBytes: 0, directories: [] },
+  })
+  const row = makeRow(document, { title: 'Gone already' })
+  document.body.appendChild(row.row)
+  const menu = makeMenu(document, row.rowFiber)
+  document.body.appendChild(menu)
+  menu.querySelector('[data-dsa-action="delete"]').dispatchEvent(makeEvent('click'))
+  await settle()
+
+  const dialog = document.body.querySelector('[role="dialog"]')
+  assert.notEqual(dialog, null)
+  assert.equal(dialog.textContent.includes(state.dictionary.zh.blockedMissing), true)
+  const confirm = dialog.querySelectorAll('button')[1]
+  assert.equal(confirm.hasAttribute('disabled'), false, 'the leftover row stays actionable')
+  assert.equal(confirm.textContent, state.dictionary.zh.removeRow)
+
+  confirm.dispatchEvent(makeEvent('click'))
+  await settle()
+  assert.deepEqual(calls.map(entry => entry.url), [
+    '/api2/dsh-session-actions/inspect',
+    '/api2/dsh-session-actions/delete',
+  ])
+  assert.deepEqual(state.removed, [SESSION], 'the row leaves the list')
+  assert.equal(document.body.querySelector('[role="dialog"]'), null, 'and the dialog closes behind it')
+})
+
 test('a rejected delete keeps the dialog open with the failure', async (t) => {
   const { document, state } = await boot()
   t.after(() => { for (const dispose of state.cleanups) dispose() })

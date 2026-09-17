@@ -152,6 +152,10 @@ Zero dependencies, `node:test`. Three layers: `test/session-files.test.mjs`
 builds the real storage layout in a temp directory and asserts what survives;
 `test/plugin.test.mjs` drives the trust fence, request validation, the
 running-Session refusal, and the `api-session/removed` announcement through a
+
+**A deletion must leave no trace, including the trace another plugin keeps.** So the Host half emits `conversation/deleted` (payload: the removed session id) after the storage is gone and before it announces `api-session/removed`, letting any plugin that remembers the conversation drop its record — `dsh-conversation-link`, for one, forgets the handle, the nickname, and the edge. The order is deliberate: plugins forget first, the list collapses after. A throwing listener is logged and cannot turn a completed deletion into a failure.
+
+**A Conversation whose storage was already removed outside this surface is still cleared.** `inspect` then answers `exists: false`, the confirmation explains that only the list row is left, and the primary button becomes **Remove from list** while staying actionable. Confirming runs the same delete route: the missing directory is a no-op, while the projection cache and the workspace-registry references are still pruned and `api-session/removed` is still broadcast, so the row disappears. There is no longer a delete dialog that looks clickable and does nothing.
 fake Cordis context; `test/client.test.mjs` runs the browser half against a
 small fake DOM and a stateful React stand-in: fiber id lookup, double-click
 rename, the right-click menu, menu decoration and re-placement, the dismiss

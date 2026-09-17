@@ -245,7 +245,59 @@ test('delete removes an attached but idle Session', async (t) => {
   assert.equal(existsSync(join(sessionsRoot(home), '--Users-someone-project--', SESSION)), false)
   // The browser drops the row off this event, so it must name the Session that
   // just lost its storage.
-  assert.deepEqual(events, [['api-session/removed', SESSION]])
+  assert.deepEqual(events, [['conversation/deleted', SESSION], ['api-session/removed', SESSION]])
+})
+
+test('delete clears a row whose storage is already gone', async (t) => {
+  const home = makeHome()
+  t.after(() => { rmSync(home, { recursive: true, force: true }) })
+  // The log was removed outside this surface while the process still holds the
+  // Session: the sidebar keeps rendering the row, and that row has to go.
+  rmSync(join(sessionsRoot(home), '--Users-someone-project--', SESSION), { recursive: true, force: true })
+  const { routes, events } = mount({ home, loaded: [SESSION] })
+  const res = await invoke(routes.get(`${ROUTE_PREFIX}/delete`), { body: JSON.stringify({ sessionId: SESSION }) })
+  assert.equal(res.status, 200)
+  assert.equal(res.payload.value.loaded, true, 'the row was still attached')
+  assert.equal(res.payload.value.missing, true, 'nothing was on disk to remove')
+  assert.equal(res.payload.value.freedBytes, 0)
+  assert.deepEqual(events, [
+    ['conversation/deleted', SESSION],
+    ['api-session/removed', SESSION],
+  ], 'a deletion that leaves the row behind is not a deletion')
+})
+
+test('delete tells other plugins to forget the Conversation before the row goes', async (t) => {
+  const home = makeHome()
+  t.after(() => { rmSync(home, { recursive: true, force: true }) })
+  const { routes, events } = mount({ home })
+  await invoke(routes.get(`${ROUTE_PREFIX}/delete`), { body: JSON.stringify({ sessionId: SESSION }) })
+  // Order matters: a plugin holding a nickname for the Conversation has to drop
+  // it before the list stops showing the conversation it names.
+  assert.deepEqual(events.map(entry => entry[0]), ['conversation/deleted', 'api-session/removed'])
+})
+
+test('a throwing conversation/deleted listener cannot turn a completed delete into a failure', async (t) => {
+  const home = makeHome()
+  t.after(() => { rmSync(home, { recursive: true, force: true }) })
+  const { routes, events } = mount({ home, emitThrows: true })
+  const res = await invoke(routes.get(`${ROUTE_PREFIX}/delete`), { body: JSON.stringify({ sessionId: SESSION }) })
+  assert.equal(res.status, 200)
+  assert.equal(res.payload.value.missing, false)
+  assert.deepEqual(events, [])
+})
+
+test('a second delete of the same gone Session stays idempotent', async (t) => {
+  const home = makeHome()
+  t.after(() => { rmSync(home, { recursive: true, force: true }) })
+  rmSync(join(sessionsRoot(home), '--Users-someone-project--', SESSION), { recursive: true, force: true })
+  const { routes, events } = mount({ home })
+  const first = await invoke(routes.get(`${ROUTE_PREFIX}/delete`), { body: JSON.stringify({ sessionId: SESSION }) })
+  const second = await invoke(routes.get(`${ROUTE_PREFIX}/delete`), { body: JSON.stringify({ sessionId: SESSION }) })
+  assert.equal(first.payload.value.missing, true)
+  assert.equal(second.status, 200)
+  assert.equal(second.payload.value.missing, true)
+  assert.deepEqual(events.map(entry => entry[0]),
+    ['conversation/deleted', 'api-session/removed', 'conversation/deleted', 'api-session/removed'])
 })
 
 test('a throwing removal listener cannot turn a completed delete into a failure', async (t) => {
@@ -268,5 +320,5 @@ test('delete permanently removes a cold Session and reports what it freed', asyn
   assert.equal(res.payload.value.freedBytes, 512)
   assert.equal(res.payload.value.registry.pruned, false)
   assert.equal(existsSync(join(sessionsRoot(home), '--Users-someone-project--', SESSION)), false)
-  assert.deepEqual(events, [['api-session/removed', SESSION]])
+  assert.deepEqual(events, [['conversation/deleted', SESSION], ['api-session/removed', SESSION]])
 })

@@ -17,6 +17,10 @@ DSH 内置的会话菜单只有 **重命名 / 分叉会话 / 归档会话**，�
 
 删除成功后，浏览器半边会直接调用会话列表自己的移除入口（`sessions.handleSessionRemoved`，也就是宿主 `api-session/removed` 事件所调用的同一个方法），行立即消失——**不再重新拉取列表**，因为那次拉取会把宿主当前基线合并回来，任何宿主仍在报告的会话都会跟着回来。宿主半边同时也会广播官方的 `api-session/removed`，作为同一条通路的冗余信号。如果删掉的恰好是**当前打开着**的那个会话，选择会先被清空（回到"没有会话"的空态），聊天面板不会继续显示一个已经不存在的会话。
 
+**删除必须不留痕迹，包括留在别的插件里的那条。** 所以宿主半边在删完之后、广播 `api-session/removed` 之前，会先发一个 `conversation/deleted`（负载就是被删的 session id），让任何自己记着这个会话的插件把记录丢掉——比如 `dsh-conversation-link` 会据此删掉它的 handle、昵称与边。顺序是刻意的：先让别的插件忘掉，再让列表收起那一行。监听器抛错只记一条 warn，不会把已经完成的删除变成失败。
+
+**会话在界外被删掉（磁盘上已经没有它）时也能收尾。** 那种情况下 `inspect` 会返回 `exists: false`，确认框改为说明"磁盘上已经没有它了，但列表里还留着这一行"，主按钮变成**从列表移除**并保持可点；确认后走同一条删除路由：不能再删的目录是空操作，但投影缓存、工作区名册引用照样会被清掉，`api-session/removed` 照样广播，于是那一行也会消失。**绝不再出现"看着能点、点了没反应"的删除框。**
+
 ## 安装
 
 本包是一个 **DSH bundle**（`package.json` 里声明了 `dsh.bundle.patch` → 包内的 `cordis.patch.yml`）。因此有两种装法，**二选一，不要同时用**：
@@ -87,8 +91,8 @@ node --test 'test/*.test.mjs'
 零依赖，用 `node:test`。测试分三层：
 
 - `test/session-files.test.mjs` —— 真实文件系统（临时目录里搭出与 DSH 一致的存储布局），断言删除后磁盘上剩下什么；
-- `test/plugin.test.mjs` —— 假 Cordis context，覆盖信任栅栏、请求校验、运行中会话拒绝、删除后的 `api-session/removed` 广播；
-- `test/client.test.mjs` —— 自建假 DOM 与一个极小的有状态 React 替身，覆盖 fiber 取 ID、双击重命名、右键开菜单、菜单行注入与重新定位、复制后关闭菜单、确认流程与删除后的列表移除。
+- `test/plugin.test.mjs` —— 假 Cordis context，覆盖信任栅栏、请求校验、运行中会话拒绝、删除后的 `conversation/deleted` + `api-session/removed` 广播、以及「磁盘上已不存在」时的幂等收尾；
+- `test/client.test.mjs` —— 自建假 DOM 与一个极小的有状态 React 替身，覆盖 fiber 取 ID、双击重命名、右键开菜单、菜单行注入与重新定位、复制后关闭菜单、确认流程、删除后的列表移除，以及残留行（磁盘已无该会话）仍可一键清掉。
 
 ## 许可
 

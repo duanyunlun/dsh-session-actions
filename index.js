@@ -215,8 +215,38 @@ function createHandler(ctx, op) {
         return
       }
       const report = await removeSession(home, sessionId)
+      // Give every plugin that keeps its own record of a Conversation the
+      // chance to drop it. Deleting a Conversation is not deletion if a
+      // nickname, an edge, or a rule pointing at it survives in some other
+      // plugin's state file — the row would be gone while the conversation
+      // lived on in everything that remembers it. A listener failure is
+      // contained: the storage is already gone, and this surface owns only the
+      // filesystem half of the deletion.
+      try {
+        ctx.emit('conversation/deleted', sessionId)
+      } catch (error) {
+        ctx.logger?.warn?.(new Error(`dsh-session-actions: conversation/deleted listener failed: ${String(error)}`))
+      }
+      // The announcement is unconditional. A row can outlive its storage — an
+      // Agent still attached in this process, or a log removed outside this
+      // surface — and a deletion that leaves that row behind is not a deletion:
+      // the conversation would still be listed, still be openable, and still
+      // look like something the user failed to remove. Round-tripping the
+      // signal here also prunes the projection cache and the workspace
+      // registry references the same way an ordinary deletion does.
       announceRemoval(ctx, sessionId)
-      respond(200, { ok: true, value: { sessionId, loaded, ...report } })
+      respond(200, {
+        ok: true,
+        value: {
+          sessionId,
+          loaded,
+          ...report,
+          // Nothing was on disk: the browser half names this outcome instead of
+          // reporting a byte count, and `missing` is what an older Host half
+          // never sent.
+          missing: report.directories.length === 0,
+        },
+      })
     } catch (error) {
       respond(400, {
         ok: false,

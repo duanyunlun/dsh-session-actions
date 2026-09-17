@@ -89,7 +89,8 @@ window.__ModuleLoader__.load({
 			cancel: '取消',
 			close: '关闭',
 			blockedRunning: '该会话正在运行中（有回合正在执行），此时删除会丢掉它正在写入的内容。请等这一轮结束后再删除。',
-			blockedMissing: '未在磁盘上找到该会话的记录，可能已被删除。',
+			blockedMissing: '磁盘上已经没有这个会话的记录，但会话列表里还留着它这一行。继续即把它从列表里清掉，不留任何痕迹。',
+			removeRow: '从列表移除',
 			detail: '将删除 {size} 数据，共 {count} 个目录。',
 			detailPath: '位置：{path}',
 			detailLoaded: '该会话当前处于打开状态：确认后它会立即从会话列表消失，进程内的副本在重启应用后彻底释放。',
@@ -107,8 +108,9 @@ window.__ModuleLoader__.load({
 			inspecting: 'Inspecting this session…',
 			cancel: 'Cancel',
 			close: 'Close',
+			removeRow: 'Remove from list',
 			blockedRunning: 'This session is running a turn right now; deleting it would discard what that turn is writing. Wait for it to finish, then delete it.',
-			blockedMissing: 'No record of this session was found on disk; it may already be deleted.',
+			blockedMissing: 'Disk no longer holds this session, and the conversation list is still showing its row. Continuing clears the row, leaving no trace.',
 			detail: 'Deletes {size} across {count} directories.',
 			detailPath: 'Location: {path}',
 			detailLoaded: 'This session is open right now: it leaves the list immediately, and the in-process copy is released when the app restarts.',
@@ -360,6 +362,10 @@ window.__ModuleLoader__.load({
 				}, [request.sessionId])
 
 				const busy = phase === 'deleting'
+				// A row whose storage is already gone is still removable: the
+				// Host's delete path prunes what is left and announces the
+				// removal, so the list drops it exactly like a real deletion.
+				const actionable = phase === 'ready' || phase === 'blocked-missing'
 				const confirm = () => {
 					setPhase('deleting')
 					setMessage(null)
@@ -423,9 +429,9 @@ window.__ModuleLoader__.load({
 						h(primitives.Button, {
 							variant: 'outline',
 							className: 'dsa-danger',
-							disabled: busy || phase !== 'ready',
+							disabled: busy || !actionable,
 							onClick: confirm,
-						}, t('deleteConfirm'))),
+						}, phase === 'blocked-missing' ? t('removeRow') : t('deleteConfirm'))),
 				}, body)
 			}
 
